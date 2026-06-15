@@ -1,11 +1,13 @@
 """
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Usage: python train.py
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Intel Gaudi (HPU) execution: lazy graph mode (NEVER eager). Must be set before
+# habana_frameworks is imported.
+os.environ.setdefault("PT_HPU_LAZY_MODE", "1")
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
@@ -17,11 +19,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# Registers the "hpu" device and the lazy-mode bridge.
+import habana_frameworks.torch.core as htcore
+# Memory-efficient (flash) fused scaled-dot-product attention for HPU. Replaces the
+# CUDA Flash-Attention-3 kernel; tiles scores so B*H*T*T is never materialized.
+from habana_frameworks.torch.hpex.kernels import FusedSDPA
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -74,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, attn_mask):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -90,8 +92,24 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        # (B, T, H, D) -> (B, H, T, D) for the fused attention kernel.
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        # Grouped-query attention: replicate KV heads to match query heads
+        if self.n_kv_head != self.n_head:
+            rep = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+        # FusedSDPA is flash-tiled (no B*H*T*T materialization). Full-causal layers
+        # use the fast is_causal path; sliding-window layers pass a precomputed
+        # additive band mask (FusedSDPA ignores window_size when is_causal=True on
+        # this Synapse version, so an explicit mask is used instead).
+        if attn_mask is None:
+            y = FusedSDPA.apply(q, k, v, None, 0.0, True, None)
+        else:
+            y = FusedSDPA.apply(q, k, v, attn_mask.to(q.dtype), 0.0, False, None)
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -115,8 +133,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, attn_mask):
+        x = x + self.attn(norm(x), ve, cos_sin, attn_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -126,6 +144,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
+        self._mask_cache = {}  # (window, T) -> additive attention mask (or None for full causal)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
@@ -205,6 +224,26 @@ class GPT(nn.Module):
         window_sizes[-1] = (long_window, 0)
         return window_sizes
 
+    def _attn_mask(self, window, T, device):
+        """Additive attention mask for a causal sliding-window of `window` tokens.
+
+        Returns None when the window spans the full sequence (use the fast is_causal
+        path in SDPA). Otherwise returns a cached (1, 1, T, T) bf16 mask where
+        disallowed positions hold a large negative value.
+        """
+        if window >= self.config.sequence_len:
+            return None
+        key = (window, T)
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            i = torch.arange(T, device=device)[:, None]
+            j = torch.arange(T, device=device)[None, :]
+            allowed = (j <= i) & (i - j < window)
+            mask = torch.zeros(T, T, dtype=torch.bfloat16, device=device)
+            mask.masked_fill_(~allowed, torch.finfo(torch.bfloat16).min)
+            mask = mask[None, None, :, :]
+            self._mask_cache[key] = mask
+        return mask
     def estimate_flops(self):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
@@ -237,13 +276,25 @@ class GPT(nn.Module):
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
+        # The value-embedding gate is a tiny (n_kv_head, 32) projection present only
+        # on VE layers. Muon's Newton-Schulz orthogonalization is degenerate for
+        # such small matrices, and on Gaudi the batched NS compile lowers to one
+        # independent per-matrix sub-DAG each (batched matmul has no cross-element
+        # op), so the stacked group becomes a graph with several disconnected
+        # components and hangs the Synapse tile-size calculator ("multiple
+        # connected components"). Route these tiny gates to AdamW instead.
+        ve_gate_params = [block.attn.ve_gate.weight for block in self.transformer.h
+                          if block.attn.ve_gate is not None]
+        ve_gate_ids = {id(p) for p in ve_gate_params}
+        matrix_params = [p for p in matrix_params if id(p) not in ve_gate_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
+            len(x0_params) + len(ve_gate_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -254,6 +305,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if ve_gate_params:
+            param_groups.append(
+                dict(kind='adamw', params=ve_gate_params, lr=matrix_lr * dmodel_lr_scale,
+                     betas=adam_betas, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
@@ -276,7 +331,8 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            attn_mask = self._attn_mask(self.window_sizes[i][0], T, idx.device)
+            x = block(x, ve, cos_sin, attn_mask)
         x = norm(x)
 
         softcap = 15
@@ -302,40 +358,49 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
+def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step, lr, beta1, beta2, eps, wd):
+    p.mul_(1 - lr * wd)
+    exp_avg.lerp_(grad, 1 - beta1)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+    bias1 = 1 - beta1 ** step
+    bias2 = 1 - beta2 ** step
+    denom = (exp_avg_sq / bias2).sqrt() + eps
+    step_size = lr / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+                    momentum, lr, wd, beta2, ns_steps, red_dim):
     # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     # Polar express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
+    # Always orthogonalize in the "wide" form (rows <= cols). For a tall matrix
+    # the tall branch's final update X @ B produces the large (rows, cols) tensor
+    # in the same fused recipe as the X.mT @ X reduction; on Gaudi the Synapse
+    # common-tile-size pass cannot reconcile those tilings and loops forever
+    # ("multiple connected components"). The wide branch compiles cleanly.
+    # orthogonalize(M) == orthogonalize(M.T).T, so transpose tall inputs, run the
+    # wide iteration, then transpose the result back (verified bit-identical).
+    transposed = X.size(-2) > X.size(-1)
+    if transposed:
+        X = X.mT.contiguous()
+    for a, b, c in polar_express_coeffs[:ns_steps]:
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.mT.contiguous()
     g = X
+    # HPU: close the orthogonalization recipe here. Keeping the NS iteration as a
+    # separate graph from the NorMuon/update tail keeps each recipe small enough
+    # to compile and run fast. Removing this split fuses everything into one large
+    # recipe that recompiles slower and processed ~27% fewer steps in the budget
+    # (val_bpb 1.559 vs 1.405). The split is a measured throughput win, not just
+    # a correctness guard.
+    htcore.mark_step()
     # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
@@ -347,8 +412,6 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
@@ -358,17 +421,6 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -381,41 +433,61 @@ class MuonAdamW(torch.optim.Optimizer):
                 state['exp_avg'] = torch.zeros_like(p)
                 state['exp_avg_sq'] = torch.zeros_like(p)
             state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
             adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+                            state['step'], group['lr'], group['betas'][0],
+                            group['betas'][1], group['eps'], group['weight_decay'])
+            # HPU lazy mode: close a graph after each parameter. A group with
+            # several independent params (e.g. the per-layer value embeddings)
+            # otherwise fuses into one recipe with multiple disconnected
+            # subgraphs, and the Synapse tile-size calculator hangs/aborts on
+            # graphs with multiple connected components.
+            htcore.mark_step()
 
     def _step_muon(self, group):
-        params = group['params']
+        params = [p for p in group['params'] if p.grad is not None]
         if not params:
             return
-        p = params[0]
-        state = self.state[p]
-        num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        shape = params[0].shape
         red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(stacked_grads, stacked_params,
-                        state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+        muon_momentum = group["momentum"]
+        muon_beta2 = group["beta2"] if group["beta2"] is not None else 0.0
+        muon_lr = group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5
+        muon_wd = group["weight_decay"]
+        # Batch all matrices of this shape into one [N, R, C] tensor and run a
+        # single batched Muon update. Every op in muon_step_fused acts on the last
+        # two dims (norm over (-2,-1), @ matmul, reductions over red_dim), so the
+        # stacked update is numerically identical to looping per matrix — but the
+        # expensive Newton-Schulz iteration lowers to ONE batched-matmul (bmm)
+        # recipe instead of N separate small-matmul graphs. On Gaudi this is the
+        # big win: optimizer.step() was ~70% of step time, dominated by per-matrix
+        # graph-launch overhead (~48 matrices x 2 graphs each). This is HORIZONTAL
+        # batching (same op over N matrices), which Gaudi handles well via bmm —
+        # unlike VERTICAL fusion (merging sequential ops into one recipe), which
+        # regressed. The orthogonalization/tail split inside muon_step_fused is
+        # preserved.
+        group_key = params[0]
+        gstate = self.state[group_key]
+        if "stacked_momentum" not in gstate:
+            n = len(params)
+            gstate["stacked_momentum"] = torch.zeros((n, *shape), dtype=group_key.dtype, device=group_key.device)
+            sshape = (n, shape[-2], 1) if shape[-2] >= shape[-1] else (n, 1, shape[-1])
+            gstate["stacked_second"] = torch.zeros(sshape, dtype=group_key.dtype, device=group_key.device)
+        stacked_grad = torch.stack([p.grad for p in params])
+        stacked_param = torch.stack([p.data for p in params])
+        muon_step_fused(stacked_grad, stacked_param,
+                        gstate["stacked_momentum"], gstate["stacked_second"],
+                        muon_momentum, muon_lr, muon_wd,
+                        muon_beta2, group["ns_steps"], red_dim)
+        htcore.mark_step()  # close the batched update recipe
+        # Write the updated weights back into the individual leaf params. Each
+        # copy_ reads a slice of the (now materialized) stacked tensor into its own
+        # leaf, with a mark_step per param so the writeback stays a single
+        # connected-component graph (a fused N-into-N scatter hangs the Synapse
+        # tile-size calculator — "multiple connected components"). These copies are
+        # trivial vs the batched compute they replace.
+        for i, p in enumerate(params):
+            p.data.copy_(stacked_param[i])
+            htcore.mark_step()
 
     @torch.no_grad()
     def step(self):
@@ -448,7 +520,14 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+# Per-device micro-batch. On Gaudi 2 the fp32 logits tensor is
+# DEVICE_BATCH_SIZE * MAX_SEQ_LEN * vocab_size * 4 bytes; at 128 that is 8 GB and
+# the fused fwd/bwd graph (several logit-sized intermediates) overflows HPU DRAM
+# ("Failed to allocate DRAM tensors"). 64 keeps logits at ~4 GB with ample
+# headroom on the 96 GB card, and halves the gradient-accumulation iteration
+# count vs 32 (bigger MME tiles, fewer graph launches per optimizer step).
+# TOTAL_BATCH_SIZE is held constant via the gradient-accumulation step count.
+DEVICE_BATCH_SIZE = 64  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -456,11 +535,15 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+try:
+    torch.hpu.random.manual_seed_all(42)
+except Exception:
+    pass
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+device = torch.device("hpu")
+autocast_ctx = torch.autocast(device_type="hpu", dtype=torch.bfloat16)
+# Intel Gaudi 2 peak BF16 (MME) throughput, used for MFU estimation.
+GAUDI2_BF16_PEAK_FLOPS = 432e12
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -483,6 +566,10 @@ with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+# Flush the weight-materialization + init graph so it compiles and allocates on
+# its own, separate from the first training/data-transfer graph (HPU lazy mode).
+htcore.mark_step()
+torch.hpu.synchronize()
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -505,7 +592,13 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+# HPU runs in lazy graph mode (PT_HPU_LAZY_MODE=1); the bridge fuses ops at each
+# htcore.mark_step() boundary, so torch.compile is not used here.
+
+# Flush the optimizer-construction graph before the first dataloader copy so the
+# two are not fused into one recipe (that fused recipe fails DRAM allocation).
+htcore.mark_step()
+torch.hpu.synchronize()
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -541,7 +634,7 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    torch.hpu.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -549,7 +642,15 @@ while True:
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
+        htcore.mark_step()  # close the fwd/bwd graph for this micro-step
         x, y, epoch = next(train_loader)
+
+    # Read the loss scalar here, while its fwd/bwd graph is still the most recent
+    # recipe. Deferring the .item() until after optimizer.step()+mark_step makes
+    # the Synapse graph compiler build a degenerate readback graph from a detached
+    # scalar whose producers were already freed, and it fails the tile-size
+    # calculator ("multiple connected components"). The d2h sync count is unchanged.
+    train_loss_f = train_loss.item()
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -562,16 +663,15 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
+    htcore.mark_step()  # close the optimizer-step graph
     model.zero_grad(set_to_none=True)
-
-    train_loss_f = train_loss.item()
 
     # Fast fail: abort if loss is exploding or NaN
     if math.isnan(train_loss_f) or train_loss_f > 100:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    torch.hpu.synchronize()
     t1 = time.time()
     dt = t1 - t0
 
@@ -584,7 +684,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / GAUDI2_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -615,8 +715,11 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / GAUDI2_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+try:
+    peak_vram_mb = torch.hpu.max_memory_allocated() / 1024 / 1024
+except Exception:
+    peak_vram_mb = 0.0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")

@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: autoresearch-debug
+  namespace: autoresearch
+  labels:
+    app: autoresearch-debug
+spec:
+  restartPolicy: Never
+  runtimeClassName: habana
+  hostIPC: true
+  securityContext:
+    runAsNonRoot: false
+    runAsUser: 0
+  tolerations:
+    - key: "habana"
+      operator: "Exists"
+      effect: "NoSchedule"
+  containers:
+    - name: debug
+      image: registry.example.com/autoresearch-gaudi:latest
+      imagePullPolicy: Always
+      command: ["/bin/bash", "-c", "sleep 36000"]
+      env:
+        - name: PT_HPU_LAZY_MODE
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: HF_HUB_DISABLE_PROGRESS_BARS
+          value: "1"
+        # Persist compiled HPU graphs across experiments so recompilation only
+        # happens on the first run of each unique bucket shape.
+        - name: PT_HPU_RECIPE_CACHE_CONFIG
+          value: "/root/.cache/autoresearch/recipes,False,8192"
+      resources:
+        requests:
+          cpu: "4"
+          memory: "32Gi"
+          habana.ai/gaudi: "1"
+          hugepages-2Mi: "4Gi"
+        limits:
+          cpu: "8"
+          memory: "64Gi"
+          habana.ai/gaudi: "1"
+          hugepages-2Mi: "4Gi"
+      volumeMounts:
+        - name: autoresearch-cache
+          mountPath: /root/.cache/autoresearch
+  volumes:
+    # Same hostPath as the Job so data + recipe cache survive pod restarts.
+    - name: autoresearch-cache
+      hostPath:
+        path: /mnt/autoresearch-cache
+        type: DirectoryOrCreate

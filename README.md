@@ -1,4 +1,11 @@
-# autoresearch
+# autoresearch-gaudi
+
+> **This is a modified version of [karpathy/autoresearch](https://github.com/karpathy/autoresearch).**
+> It ports the project from CUDA / single NVIDIA GPU to a single **Intel Gaudi 2 (HPU)**
+> accelerator and adds Kubernetes deployment tooling. All credit for the original idea,
+> harness, and training code goes to [@karpathy](https://github.com/karpathy) and the
+> upstream contributors. Original project: https://github.com/karpathy/autoresearch
+> (MIT). See [LICENSE](LICENSE) and [What's different in this port](#whats-different-in-this-port).
 
 ![teaser](progress.png)
 
@@ -20,22 +27,70 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** A single **Intel Gaudi 2 (HPU)**, Python 3.10+, and the Intel Gaudi
+software stack (`habana_frameworks`). On Gaudi, PyTorch ships *inside* the Intel Gaudi
+base container image (e.g. `vault.habana.ai/.../pytorch-installer-2.9.0`), so `torch` is
+intentionally **not** a PyPI dependency — installing the CUDA wheel would clobber the
+HPU build. This port is run inside Kubernetes via a debug pod, but it can also be run
+directly inside any Gaudi PyTorch container.
+
+### Option A — directly inside a Gaudi PyTorch container
 
 ```bash
+# 1. Download data and train tokenizer (one-time, ~2 min)
+python prepare.py
 
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
-uv sync
-
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
-
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# 2. Run a single training experiment (~5 min)
+python train.py
 ```
+
+### Option B — Kubernetes (the workflow used here)
+
+```bash
+# 1. Build & push the Gaudi image (podman; override REGISTRY as needed)
+REGISTRY=<your-registry> ./build-push-autoresearch-gaudi.sh
+
+# 2. Start the debug pod (requests habana.ai/gaudi: 1 + hugepages-2Mi)
+kubectl apply -f autoresearch-debug.yaml
+
+# 3. One-time data prep inside the pod
+kubectl exec -n autoresearch autoresearch-debug -- \
+  bash -c "cd /workspace/autoresearch && python prepare.py --num-shards 10"
+
+# 4. Copy your edited train.py in and run a 5-minute experiment
+kubectl cp train.py autoresearch/autoresearch-debug:/workspace/autoresearch/train.py
+kubectl exec -n autoresearch autoresearch-debug -- \
+  bash -c "cd /workspace/autoresearch && python train.py > /root/.cache/autoresearch/run.log 2>&1"
+
+# 5. Read the result
+kubectl exec -n autoresearch autoresearch-debug -- grep '^val_bpb:' /root/.cache/autoresearch/run.log
+```
+
+If the above works, your setup is good and you can go into autonomous research mode.
+
+## What's different in this port
+
+This repository keeps the original harness contract intact — `prepare.py` (fixed
+constants + `evaluate_bpb` metric) is unmodified in spirit, `train.py` is the single
+file the agent edits, and the 5-minute budget / `val_bpb` metric are unchanged. The
+changes are platform-level:
+
+- **Device**: `cuda` → `hpu`, with `habana_frameworks.torch.core` and lazy graph mode
+  (`PT_HPU_LAZY_MODE=1`); `htcore.mark_step()` is used to close graph recipes.
+- **Attention**: CUDA Flash Attention 3 `kernels` package → HPU fused SDPA.
+- **Optimizer (Muon)**: Newton–Schulz orthogonalization is always done in the "wide"
+  orientation (tall matrices are transposed) to avoid a Gaudi Synapse tile-size
+  compiler hang, and each shape-group is batched into a single `bmm` to cut
+  per-matrix graph-launch overhead.
+- **MFU**: peak-FLOPS constant set to Gaudi 2 BF16 (432 TFLOPS) for the MFU estimate.
+- **Deployment**: adds a Dockerfile, build/push script, and Kubernetes manifests
+  (`Dockerfile.autoresearch-gaudi`, `build-push-autoresearch-gaudi.sh`,
+  `autoresearch-debug.yaml`, `autoresearch-job.yaml`).
+
+> **Note on portability of results:** as the upstream README explains, the fixed
+> time budget makes results comparable *within* a platform but **not across**
+> platforms. Gaudi 2 `val_bpb` numbers here are not directly comparable to upstream
+> H100 numbers.
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
@@ -80,13 +135,22 @@ Seeing as there seems to be a lot of interest in tinkering with autoresearch on 
 
 I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
 
-## Notable forks
+## Notable forks (upstream)
+
+These are platform ports listed by the upstream project; **this repo is the Intel Gaudi 2 (HPU) port** in the same spirit:
 
 - [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
 - [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
 - [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
 - [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
 
-## License
+## Credits & License
 
-MIT
+This project is a modified version of [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
+(MIT), itself a simplified single-device implementation of
+[nanochat](https://github.com/karpathy/nanochat). All credit for the original
+concept, harness, and training code goes to [@karpathy](https://github.com/karpathy)
+and the upstream contributors. This port adapts the code to Intel Gaudi 2 (HPU) and
+adds Kubernetes tooling.
+
+Licensed under the MIT License — see [LICENSE](LICENSE).

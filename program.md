@@ -2,6 +2,35 @@
 
 This is an experiment to have the LLM do its own research.
 
+## Compute environment
+
+This repo runs on **Intel Gaudi 2 (HPU)** inside a Kubernetes cluster, not on a local machine with CUDA. There is no `uv` or local GPU. All training runs happen inside the **autoresearch debug pod** in the `autoresearch` namespace. You interact with it using `kubectl`.
+
+Key commands:
+
+```bash
+# Check the debug pod is running (must be Running before any experiment)
+kubectl get pod autoresearch-debug -n autoresearch
+
+# Start the debug pod if it is not running
+kubectl apply -f autoresearch/autoresearch-debug.yaml
+
+# Copy your edited train.py into the pod
+kubectl cp autoresearch/train.py autoresearch/autoresearch-debug:/workspace/autoresearch/train.py
+
+# Run one experiment (blocks ~5 min; output goes to the shared cache volume)
+kubectl exec -n autoresearch autoresearch-debug -- \
+  bash -c "cd /workspace/autoresearch && python train.py > /root/.cache/autoresearch/run.log 2>&1"
+
+# Read results
+kubectl exec -n autoresearch autoresearch-debug -- \
+  grep "^val_bpb:\|^peak_vram_mb:" /root/.cache/autoresearch/run.log
+
+# Read last 50 lines of log (for crash diagnosis)
+kubectl exec -n autoresearch autoresearch-debug -- \
+  tail -n 50 /root/.cache/autoresearch/run.log
+```
+
 ## Setup
 
 To set up a new experiment, work with the user to:
@@ -12,7 +41,12 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
+4. **Verify data exists**: Check that the debug pod's cache at `/root/.cache/autoresearch/` contains data shards and a tokenizer. If not, run data prep inside the pod:
+   ```bash
+   kubectl exec -n autoresearch autoresearch-debug -- \
+     bash -c "cd /workspace/autoresearch && python prepare.py --num-shards 10 \
+              > /root/.cache/autoresearch/prepare.log 2>&1 && echo DONE"
+   ```
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
@@ -20,7 +54,16 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a **single Intel Gaudi 2 HPU** inside the debug pod. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it with:
+
+```bash
+# 1. Copy the updated train.py into the pod
+kubectl cp autoresearch/train.py autoresearch/autoresearch-debug:/workspace/autoresearch/train.py
+
+# 2. Run the experiment (blocks until done, ~5 min + startup)
+kubectl exec -n autoresearch autoresearch-debug -- \
+  bash -c "cd /workspace/autoresearch && python train.py > /root/.cache/autoresearch/run.log 2>&1"
+```
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
@@ -96,9 +139,23 @@ LOOP FOREVER:
 1. Look at the git state: the current branch/commit we're on
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+4. Copy and run the experiment:
+   ```bash
+   kubectl cp autoresearch/train.py autoresearch/autoresearch-debug:/workspace/autoresearch/train.py
+   kubectl exec -n autoresearch autoresearch-debug -- \
+     bash -c "cd /workspace/autoresearch && python train.py > /root/.cache/autoresearch/run.log 2>&1"
+   ```
+5. Read out the results:
+   ```bash
+   kubectl exec -n autoresearch autoresearch-debug -- \
+     grep "^val_bpb:\|^peak_vram_mb:" /root/.cache/autoresearch/run.log
+   ```
+6. If the grep output is empty, the run crashed. Read the log:
+   ```bash
+   kubectl exec -n autoresearch autoresearch-debug -- \
+     tail -n 50 /root/.cache/autoresearch/run.log
+   ```
+   Attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
 8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
 9. If val_bpb is equal or worse, you git reset back to where you started

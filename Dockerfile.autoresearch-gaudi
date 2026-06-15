@@ -1,0 +1,48 @@
+# autoresearch (Karpathy's nanochat single-device trainer) ported to Intel Gaudi 2 / HPU.
+#
+# What the port changes vs. the original CUDA build:
+#   1. Flash-Attention-3 (the CUDA-only `kernels` package) -> HPU fused
+#      scaled_dot_product_attention with precomputed sliding-window band masks.
+#   2. Device "cuda" -> "hpu" throughout train.py / prepare.py.
+#   3. torch.compile + CUDA graphs -> HPU lazy graph mode (PT_HPU_LAZY_MODE=1)
+#      with htcore.mark_step() boundaries (NEVER eager mode).
+#   4. torch.cuda.{synchronize,max_memory_allocated} -> torch.hpu equivalents.
+#   5. MFU peak-FLOPS constant H100 (989.5 TFLOPS) -> Gaudi 2 BF16 (432 TFLOPS).
+#
+# Build:
+#   ./autoresearch/build-push-autoresearch-gaudi.sh
+#   # or: podman build -f autoresearch/Dockerfile.autoresearch-gaudi \
+#   #       -t registry.example.com/autoresearch-gaudi:latest autoresearch/
+#
+FROM vault.habana.ai/gaudi-docker/1.23.0/ubuntu24.04/habanalabs/pytorch-installer-2.9.0:latest
+
+WORKDIR /workspace/autoresearch
+
+# Rust toolchain so rustbpe can build from source if no manylinux wheel is published.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cargo \
+    rustc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps. torch is ALREADY provided by the Gaudi base image — do NOT reinstall
+# it (a PyPI/CUDA torch would clobber the habana_frameworks build). numpy is left
+# at the base-image version to avoid breaking the habana torch ABI.
+RUN pip install --no-cache-dir \
+    "matplotlib>=3.10.8" \
+    "pandas>=2.3.3" \
+    "pyarrow>=21.0.0" \
+    "requests>=2.32.0" \
+    "rustbpe>=0.1.0" \
+    "tiktoken>=0.11.0"
+
+# Application files (prepare.py is read-only data prep + eval; train.py is the model).
+COPY prepare.py train.py program.md README.md pyproject.toml ./
+
+# Intel Gaudi: lazy graph mode (NEVER eager). Set here and in the Job manifest.
+ENV PT_HPU_LAZY_MODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1
+
+# Default: run one 5-minute training experiment. The Job manifest runs prepare.py
+# first (idempotent) to ensure data + tokenizer exist in the mounted cache.
+CMD ["python", "train.py"]

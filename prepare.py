@@ -23,6 +23,9 @@ import rustbpe
 import tiktoken
 import torch
 
+# Registers the "hpu" device and the lazy-mode bridge (used by evaluate_bpb).
+import habana_frameworks.torch.core as htcore
+
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
@@ -293,14 +296,14 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
+    # Pre-allocate CPU buffers: [inputs (B*T) | targets (B*T)]. The device tensor
+    # is allocated fresh each iteration (below) rather than mutated in place: an
+    # in-place copy into a persistent device buffer aliases the previous graph's
+    # inputs across mark_step boundaries in HPU lazy mode and fails allocation.
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
 
     while True:
         for row_idx in range(B):
@@ -333,7 +336,10 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        gpu_buffer = cpu_buffer.to("hpu")  # fresh device allocation, no aliasing
+        inputs = gpu_buffer[:B * T].view(B, T)
+        targets = gpu_buffer[B * T:].view(B, T)
+        htcore.mark_step()  # execute the H2D transfer now, don't defer into compute graph
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -349,7 +355,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes(device="hpu")
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
@@ -360,6 +366,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
         y_flat = y.view(-1)
         nbytes = token_bytes[y_flat]
         mask = nbytes > 0
+        htcore.mark_step()
         total_nats += (loss_flat * mask).sum().item()
         total_bytes += nbytes.sum().item()
     return total_nats / (math.log(2) * total_bytes)

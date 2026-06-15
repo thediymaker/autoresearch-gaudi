@@ -1,0 +1,104 @@
+# autoresearch single-experiment Job on Intel Gaudi 2 (HPU).
+#
+# Runs one 5-minute training experiment (train.py) after ensuring the data shards
+# + BPE tokenizer exist in a persistent cache (prepare.py is idempotent — it skips
+# work that is already done). The final val_bpb is printed in the pod logs.
+#
+# Prerequisites:
+#   1. Build + push the image:  ./autoresearch/build-push-autoresearch-gaudi.sh
+#      (override the image below if you push to registry.example.com)
+#   2. A writable cache location for ~/.cache/autoresearch (data download is slow;
+#      a PVC or hostPath keeps it across runs). Default below is a hostPath.
+#   3. Cluster egress to huggingface.co for the first data download.
+#
+# Usage:
+#   kubectl apply -f autoresearch/autoresearch-job.yaml
+#   kubectl logs -f -n autoresearch job/autoresearch-experiment
+#
+# Re-run:
+#   kubectl delete job autoresearch-experiment -n autoresearch
+#   kubectl apply -f autoresearch/autoresearch-job.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoresearch
+  labels:
+    app.kubernetes.io/name: autoresearch
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: autoresearch-experiment
+  namespace: autoresearch
+  labels:
+    app: autoresearch-experiment
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400  # auto-cleanup after 24h
+  template:
+    metadata:
+      labels:
+        app: autoresearch-experiment
+    spec:
+      restartPolicy: Never
+      runtimeClassName: habana
+      hostIPC: true
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      tolerations:
+        - key: "habana"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: autoresearch
+          image: registry.example.com/autoresearch-gaudi:latest
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              # One-time (idempotent) data + tokenizer prep, then a 5-min experiment.
+              python prepare.py --num-shards 10
+              python train.py
+          env:
+            - name: PT_HPU_LAZY_MODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # NOTE: do NOT set HABANA_VISIBLE_DEVICES here. The Habana k8s device
+            # plugin assigns a specific free card via cgroup + injected env;
+            # hardcoding it (e.g. "0") targets a card the container isn't permitted
+            # to fully use and causes "Failed to allocate DRAM tensors".
+            - name: HF_HUB_DISABLE_PROGRESS_BARS
+              value: "1"
+            # Persist compiled HPU graphs across the run (single writer = safe on a PVC).
+            - name: PT_HPU_RECIPE_CACHE_CONFIG
+              value: "/root/.cache/autoresearch/recipes,False,8192"
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+              habana.ai/gaudi: "1"
+              hugepages-2Mi: "4Gi"
+            limits:
+              cpu: "16"
+              memory: "128Gi"
+              habana.ai/gaudi: "1"
+              hugepages-2Mi: "4Gi"
+          volumeMounts:
+            - name: autoresearch-cache
+              mountPath: /root/.cache/autoresearch
+      volumes:
+        # === EDIT: point to your cache location ===
+        # Option A: hostPath (simple, node-local; data is re-downloaded if rescheduled).
+        - name: autoresearch-cache
+          hostPath:
+            path: /mnt/autoresearch-cache
+            type: DirectoryOrCreate
+        # Option B: PersistentVolumeClaim (recommended; survives rescheduling):
+        # - name: autoresearch-cache
+        #   persistentVolumeClaim:
+        #     claimName: autoresearch-cache-pvc

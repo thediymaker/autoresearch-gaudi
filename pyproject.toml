@@ -1,11 +1,15 @@
 [project]
-name = "autoresearch"
+name = "autoresearch-gaudi"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Autonomous pretraining research swarm (Intel Gaudi 2 / HPU)"
 readme = "README.md"
 requires-python = ">=3.10"
+# NOTE: torch is NOT listed here. On Intel Gaudi (HPU) the PyTorch build ships
+# with the Intel Gaudi software stack (habana_frameworks) inside the base
+# container image (vault.habana.ai/.../pytorch-installer-2.9.0). Installing torch
+# from PyPI/CUDA would clobber that build. The FA3 `kernels` package is CUDA-only
+# and is replaced by HPU fused SDPA.
 dependencies = [
-    "kernels>=0.11.7",
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
@@ -13,15 +17,4 @@ dependencies = [
     "requests>=2.32.0",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
-    "torch==2.9.1",
 ]
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
