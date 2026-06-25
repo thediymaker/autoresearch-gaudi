@@ -386,10 +386,12 @@ def run_baseline(exp: Experiment):
     """
     if WARM_BASELINE:
         print(f"[harness] warming HPU recipe cache for '{exp.name}' (throwaway run) ...", flush=True)
+        t_w = time.time()
         warm = exp.run_experiment(allow_unchanged=True)
         wv = warm.get("metrics", {}).get(exp.metric)
-        print(f"[harness] warmup {exp.metric} = {wv} (discarded)", flush=True)
+        print(f"[harness] warmup {exp.metric} = {wv} (discarded, {time.time() - t_w:.0f}s)", flush=True)
     print(f"[harness] running baseline for '{exp.name}' ...", flush=True)
+    t_b = time.time()
     result = exp.run_experiment(allow_unchanged=True)
     metric_val = result.get("metrics", {}).get(exp.metric)
     if result.get("status") != "ok" or metric_val is None:
@@ -399,7 +401,28 @@ def run_baseline(exp: Experiment):
     exp._record(result, "keep", "baseline")
     shutil.copy2(exp.artifact, exp.best_backup)
     exp.best_sha = exp.artifact_sha()
-    print(f"[harness] baseline {exp.metric} = {metric_val} (goal: {exp.goal})", flush=True)
+    print(f"[harness] baseline {exp.metric} = {metric_val} (goal: {exp.goal}, {time.time() - t_b:.0f}s)", flush=True)
+
+
+def _short(text, limit=200):
+    """Collapse whitespace and truncate for one-line console logging."""
+    s = " ".join(str(text).split())
+    return s if len(s) <= limit else s[: limit - 1] + "\u2026"
+
+
+def _describe_call(name, args):
+    """Human-readable summary of a tool call so you can watch what the model does."""
+    if name == "edit_artifact":
+        return f"replace [{_short(args.get('old_str', ''), 70)}] -> [{_short(args.get('new_str', ''), 70)}]"
+    if name == "keep":
+        return f"KEEP \u2014 {_short(args.get('description', ''), 160)}"
+    if name == "discard":
+        return f"DISCARD \u2014 {_short(args.get('reason', ''), 160)}"
+    if name == "run_experiment":
+        return "score the current artifact (training run \u2014 several minutes)\u2026"
+    if name == "read_artifact":
+        return "re-read the artifact"
+    return "(" + ", ".join(args.keys()) + ")"
 
 
 def iteration(exp: Experiment, history: str, idx: int) -> str:
@@ -427,9 +450,21 @@ def iteration(exp: Experiment, history: str, idx: int) -> str:
     last_result = None
     reads = 0
     for step in range(MAX_TOOL_STEPS):
+        print(f"[iter {idx} step {step}] brain thinking ...", flush=True)
+        t_brain = time.time()
         msg = chat(messages, tools)
+        dt = time.time() - t_brain
         messages.append(msg)
         tool_calls = msg.get("tool_calls") or []
+
+        # Surface the model's own words (and any reasoning trace) so you can
+        # follow its thinking and tell when it is just stalling on the endpoint.
+        reasoning = (msg.get("content") or msg.get("reasoning_content")
+                     or msg.get("reasoning") or "").strip()
+        if reasoning:
+            print(f"[iter {idx} step {step}] brain ({dt:.0f}s): {_short(reasoning, 500)}", flush=True)
+        else:
+            print(f"[iter {idx} step {step}] brain replied in {dt:.0f}s", flush=True)
 
         if not tool_calls:
             # Model spoke without acting; nudge it to use a tool.
@@ -445,7 +480,7 @@ def iteration(exp: Experiment, history: str, idx: int) -> str:
                 args = json.loads(tc["function"].get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            print(f"[iter {idx} step {step}] -> {name}({', '.join(args.keys())})", flush=True)
+            print(f"[iter {idx} step {step}] -> {name}: {_describe_call(name, args)}", flush=True)
 
             if name == "read_artifact":
                 reads += 1
@@ -461,10 +496,12 @@ def iteration(exp: Experiment, history: str, idx: int) -> str:
             elif name == "edit_artifact":
                 result = exp.edit_artifact(args.get("old_str", ""), args.get("new_str", ""))
             elif name == "run_experiment":
+                t_run = time.time()
                 result = exp.run_experiment()
                 last_result = result
                 mv = result.get("metrics", {}).get(exp.metric)
-                print(f"[iter {idx}] experiment {exp.metric}={mv} status={result.get('status')}", flush=True)
+                print(f"[iter {idx}] experiment {exp.metric}={mv} status={result.get('status')} "
+                      f"({time.time() - t_run:.0f}s)", flush=True)
             elif name == "keep":
                 r = exp.keep(args.get("description", ""), last_result)
                 if r.get("ok"):
@@ -514,6 +551,12 @@ def main():
             shutil.copy2(exp.best_backup, exp.artifact)
             print(f"[harness] resuming: best {exp.metric} = {seeded} (from results.tsv)", flush=True)
     else:
+        # If a previous run was killed mid-iteration (before keep/discard), the
+        # artifact on disk may be a broken, un-reverted edit. Restore the known-
+        # good backup so the baseline always starts from a clean, working state.
+        if exp.best_backup.exists():
+            shutil.copy2(exp.best_backup, exp.artifact)
+            print("[harness] restored artifact from last known-good backup", flush=True)
         run_baseline(exp)
 
     history_lines = []
