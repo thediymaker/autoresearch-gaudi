@@ -131,12 +131,29 @@ python harness/run_loop.py --experiment experiments/gpt_train --iterations 5
 
 The harness exits early with `OPENAI_API_KEY is not set` if the key is missing.
 
+### Option C — the notebook control panel (`analysis.ipynb`)
+
+For the easiest path, open `analysis.ipynb`. It is a one-stop control panel that
+loads your config from a `.env` file, preflight-checks that both the Gaudi debug
+pod and your OpenAI-compatible API are reachable, runs the loop, and plots the
+results — all from one place. Set it up once:
+
+```bash
+cp .env.example .env      # then edit .env with your values
+```
+
+`.env` holds the same `OPENAI_*` variables as above (plus the pod
+namespace/name and loop defaults) and is gitignored so your key is never
+committed. Then just run the cells top to bottom.
+
 ## Project structure
 
 ```
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
+analysis.ipynb  — control panel: configure (.env), preflight, run loop, analyze
+.env.example    — template for local config (copy to .env)
 pyproject.toml  — dependencies
 ```
 

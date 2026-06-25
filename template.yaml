@@ -1,0 +1,373 @@
+---
+# autoresearch on Gaudi — S3-backed, PVC-free, JupyterLab-managed
+#
+# Runs the Gaudi (HPU) port of Karpathy's `autoresearch` single-file nanochat
+# trainer (https://github.com/thediymaker/autoresearch-gaudi) inside a
+# disposable single-user JupyterLab IDE. JupyterLab is the *management* surface:
+# use its terminal to run `prepare.py` / `train.py` and the included
+# `analysis.ipynb` to plot results. Each launch allocates Gaudi HPU(s) so the
+# 5-minute training experiments run directly on the accelerator.
+#
+# Why this template looks the way it does
+# ---------------------------------------
+#   * NO PersistentVolume. All durable state lives in S3 (the synced
+#     `s3-workspace` secret). The pod uses a node-local emptyDir scratch capped
+#     at {{SCRATCH_LIMIT}} so a runaway download can't fill the node.
+#   * The autoresearch environment is set up for you on boot: the repo is cloned
+#     and the extra Python deps (+ JupyterLab + a Rust toolchain for rustbpe)
+#     are installed, so the IDE comes up ready to train.
+#   * RESUMABLE + IDEMPOTENT. Durable state is keyed by {{WORKSPACE_NAME}} at
+#     s3://$S3_BUCKET/${S3_PREFIX}autoresearch/{{WORKSPACE_NAME}}/. On launch:
+#       - If that S3 location ALREADY EXISTS, it is restored into the pod and
+#         left as-is — your edited train.py, prepared data/tokenizer cache,
+#         compiled HPU recipe cache, and results are NOT overwritten or
+#         re-initialized.
+#       - If it does NOT exist, a fresh workspace is initialized (clone + a
+#         one-time `prepare.py` data/tokenizer build in the background).
+#     A sidecar continuously syncs the workspace back to S3 (`aws s3 sync`
+#     WITHOUT --delete), so existing S3 objects are only added/updated, never
+#     deleted.
+#
+# Usage:
+#   kubectl apply -f autoresearch-gaudi.yaml
+#   kubectl port-forward service/{{APP_NAME}}-{{RUN_ID}} {{PORT}}:{{PORT}}
+#   # then, in the JupyterLab terminal:
+#   #   cd ~/autoresearch && python prepare.py   # (auto-run once on fresh init)
+#   #   python train.py                          # one 5-minute experiment
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{APP_NAME}}-{{RUN_ID}}
+  labels:
+    app: {{APP_NAME}}-{{RUN_ID}}
+    workload-type: autoresearch
+spec:
+  replicas: 1
+  # Recreate (not RollingUpdate) so two pods never mount/sync the same S3
+  # workspace concurrently during a restart.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{APP_NAME}}-{{RUN_ID}}
+  template:
+    metadata:
+      labels:
+        app: {{APP_NAME}}-{{RUN_ID}}
+        workload-type: autoresearch
+    spec:
+      runtimeClassName: habana
+      hostIPC: true
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+      nodeSelector:
+        habana.ai/gaudi: present
+      tolerations:
+        - key: "habana"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "habana"
+          operator: "Exists"
+          effect: "NoExecute"
+      initContainers:
+        # ------------------------------------------------------------------
+        # Restore durable state from S3 (idempotent, never destructive).
+        #
+        # S3 is mandatory for this template. If the workspace prefix already
+        # has objects, download them into /workspace and DO NOT touch S3 — the
+        # existing run is resumed exactly as-is. If it is empty, just prepare
+        # empty directories and let the main container initialize a fresh repo.
+        # ------------------------------------------------------------------
+        - name: restore-workspace
+          image: amazon/aws-cli:latest
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: s3-workspace
+                optional: true
+          env:
+            - name: AWS_REQUEST_CHECKSUM_CALCULATION
+              value: "when_required"
+            - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+              value: "when_required"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+
+              # --- S3 is required: fail fast with a clear message ---
+              if [ -z "${S3_BUCKET:-}" ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+                echo "ERROR: This template requires the S3 workspace (s3-workspace) secret." >&2
+                echo "       Configure S3 Storage in the dashboard, then relaunch." >&2
+                exit 1
+              fi
+
+              WORK="/workspace"
+              S3_BASE="s3://${S3_BUCKET}/${S3_PREFIX}autoresearch/{{WORKSPACE_NAME}}"
+              mkdir -p "${WORK}"
+
+              EP=""
+              if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
+                EP="--endpoint-url ${AWS_ENDPOINT_URL}"
+              fi
+
+              # Does the workspace already exist on S3?
+              if aws s3 ls "${S3_BASE}/" ${EP} 2>/dev/null | grep -q .; then
+                echo "Existing S3 workspace found at ${S3_BASE}/ — restoring (will NOT overwrite it)."
+                # Download-only sync: pull everything down, never delete locally
+                # and never push, so the S3 copy is left untouched here.
+                aws s3 sync "${S3_BASE}/" "${WORK}/" --no-progress ${EP}
+                touch "${WORK}/.autoresearch-restored"
+              else
+                echo "No existing S3 workspace at ${S3_BASE}/ — a fresh one will be initialized."
+                rm -f "${WORK}/.autoresearch-restored"
+              fi
+
+              # Caches live under HOME=/workspace; make sure the tree exists.
+              mkdir -p "${WORK}/.cache/autoresearch/recipes"
+              chmod -R g+rwX "${WORK}" || true
+          volumeMounts:
+            - name: scratch
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+              ephemeral-storage: "{{SCRATCH_LIMIT}}"
+      containers:
+        # ------------------------------------------------------------------
+        # JupyterLab + autoresearch training environment (on Gaudi HPU).
+        # ------------------------------------------------------------------
+        - name: autoresearch
+          image: {{IMAGE}}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+          envFrom:
+            - secretRef:
+                name: s3-workspace
+                optional: true
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -e
+
+              REPO_DIR="$HOME/autoresearch"
+
+              # --- Tooling: JupyterLab + Rust (for rustbpe) + git, on first boot.
+              # torch is already provided by the Gaudi base image — never pip
+              # install it (a CUDA wheel would clobber the habana_frameworks build).
+              if ! command -v git >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+                apt-get update && apt-get install -y --no-install-recommends git cargo rustc || true
+                rm -rf /var/lib/apt/lists/* || true
+              fi
+              if ! command -v jupyter-lab >/dev/null 2>&1; then
+                pip install --no-cache-dir jupyterlab
+              fi
+              pip install --no-cache-dir \
+                "matplotlib>=3.10.8" \
+                "pandas>=2.3.3" \
+                "pyarrow>=21.0.0" \
+                "requests>=2.32.0" \
+                "rustbpe>=0.1.0" \
+                "tiktoken>=0.11.0"
+
+              # --- Clone the repo ONLY if it was not restored from S3. Restored
+              # workspaces keep their edited train.py / program.md untouched.
+              if [ ! -e "${REPO_DIR}/.git" ] && [ ! -f "${REPO_DIR}/train.py" ]; then
+                echo "Cloning autoresearch from {{REPO_URL}} ..."
+                git clone --depth 1 "{{REPO_URL}}" "${REPO_DIR}"
+              else
+                echo "autoresearch already present (restored or pre-existing) — leaving it as-is."
+              fi
+
+              # --- One-time data prep on a FRESH workspace only. Runs in the
+              # background so JupyterLab is available immediately; the prepared
+              # data + tokenizer land in $HOME/.cache/autoresearch and are then
+              # synced to S3 by the sidecar.
+              if [ ! -f "${HOME}/.cache/autoresearch/.prepared" ]; then
+                (
+                  cd "${REPO_DIR}" && \
+                  python prepare.py --num-shards {{NUM_SHARDS}} \
+                    > "${HOME}/prepare.log" 2>&1 && \
+                  touch "${HOME}/.cache/autoresearch/.prepared" \
+                  || echo "prepare.py failed; see ~/prepare.log" >> "${HOME}/prepare.log"
+                ) &
+                echo "Started one-time data prep in the background (see ~/prepare.log)."
+              else
+                echo "Data/tokenizer cache already prepared — skipping prepare.py."
+              fi
+
+              exec jupyter lab \
+                --ip=0.0.0.0 \
+                --port={{PORT}} \
+                --no-browser \
+                --allow-root \
+                --ServerApp.base_url=/ \
+                --ServerApp.token='' \
+                --ServerApp.password='' \
+                --ServerApp.disable_check_xsrf=True \
+                --ServerApp.allow_origin='*' \
+                --ServerApp.allow_remote_access=True \
+                --ServerApp.root_dir="$HOME"
+          env:
+            # HOME points at the synced scratch so the repo, results, JupyterLab
+            # config, AND the autoresearch data/recipe cache (~/.cache/autoresearch)
+            # all live under /workspace and get persisted to S3.
+            - name: HOME
+              value: /workspace
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # Keep the pip cache OFF the synced tree so it isn't pushed to S3.
+            - name: PIP_CACHE_DIR
+              value: /tmp/pip-cache
+            - name: JUPYTER_CONFIG_DIR
+              value: /workspace/.jupyter
+            - name: JUPYTERLAB_SETTINGS_DIR
+              value: /workspace/.jupyter/lab/user-settings
+            # Intel Gaudi: lazy graph mode (NEVER eager) + persist compiled HPU
+            # recipes across experiments so recompilation only happens once per
+            # unique bucket shape.
+            - name: PT_HPU_LAZY_MODE
+              value: "1"
+            - name: HF_HUB_DISABLE_PROGRESS_BARS
+              value: "1"
+            - name: PT_HPU_RECIPE_CACHE_CONFIG
+              value: "/workspace/.cache/autoresearch/recipes,False,8192"
+          ports:
+            - containerPort: {{PORT}}
+              name: http
+          resources:
+            requests:
+              cpu: "{{CPU}}"
+              memory: "{{MEMORY}}"
+              ephemeral-storage: "2Gi"
+              habana.ai/gaudi: "{{GPU_COUNT}}"
+              hugepages-2Mi: "2Gi"
+            limits:
+              cpu: "{{CPU}}"
+              memory: "{{MEMORY}}"
+              ephemeral-storage: "{{SCRATCH_LIMIT}}"
+              habana.ai/gaudi: "{{GPU_COUNT}}"
+              hugepages-2Mi: "2Gi"
+          volumeMounts:
+            - name: scratch
+              mountPath: /workspace
+            - name: shm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet:
+              path: /api
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            # Generous budget to cover the one-time JupyterLab + deps install.
+            failureThreshold: 180
+          readinessProbe:
+            httpGet:
+              path: /api
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+        # ------------------------------------------------------------------
+        # Continuous S3 sync-back (additive only — never deletes S3 objects).
+        # ------------------------------------------------------------------
+        - name: s3-sync
+          image: amazon/aws-cli:latest
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: s3-workspace
+                optional: true
+          env:
+            # See repo note: AWS CLI v2.23+ streaming CRC32 checksum (aws-chunked)
+            # is rejected by the Isilon S3 endpoint. Force checksums to
+            # "when_required" so uploads use a plain Content-Length body.
+            - name: AWS_REQUEST_CHECKSUM_CALCULATION
+              value: "when_required"
+            - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+              value: "when_required"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              WORK="/workspace"
+              S3_BASE="s3://${S3_BUCKET}/${S3_PREFIX}autoresearch/{{WORKSPACE_NAME}}"
+              EP=""
+              if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
+                EP="--endpoint-url ${AWS_ENDPOINT_URL}"
+              fi
+
+              echo "Sync-back every {{SYNC_INTERVAL}}s: ${WORK} -> ${S3_BASE}/ (additive, no deletes)."
+              while true; do
+                sleep {{SYNC_INTERVAL}}
+                # No --delete: existing S3 objects are preserved; only
+                # new/changed local files are uploaded. Skip throwaway caches.
+                aws s3 sync "${WORK}/" "${S3_BASE}/" \
+                  --no-progress ${EP} \
+                  --exclude ".pip-cache/*" \
+                  --exclude "*/__pycache__/*" \
+                  --exclude "*.pyc" \
+                  --exclude ".autoresearch-restored" \
+                  || echo "WARN: sync attempt failed; will retry next interval." >&2
+              done
+          volumeMounts:
+            - name: scratch
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+              ephemeral-storage: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+              ephemeral-storage: "1Gi"
+      volumes:
+        # Node-local scratch only — no PersistentVolume is created. All durable
+        # state is mirrored to S3 by the sidecar.
+        - name: scratch
+          emptyDir:
+            sizeLimit: "{{SCRATCH_LIMIT}}"
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{APP_NAME}}-{{RUN_ID}}
+  labels:
+    app: {{APP_NAME}}-{{RUN_ID}}
+    workload-type: autoresearch
+spec:
+  type: ClusterIP
+  selector:
+    app: {{APP_NAME}}-{{RUN_ID}}
+  ports:
+    - port: {{PORT}}
+      targetPort: http
+      protocol: TCP
+      name: http
