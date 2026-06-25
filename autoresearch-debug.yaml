@@ -18,9 +18,9 @@ spec:
       effect: "NoSchedule"
   containers:
     - name: debug
-      image: registry.example.com/autoresearch-gaudi:latest
+      image: localhost:30500/autoresearch-gaudi:latest
       imagePullPolicy: Always
-      command: ["/bin/bash", "-c", "sleep 36000"]
+      command: ["/bin/bash", "-c", "sleep infinity"]
       env:
         - name: PT_HPU_LAZY_MODE
           value: "1"

@@ -6,7 +6,7 @@
 #
 # Prerequisites:
 #   1. Build + push the image:  ./autoresearch/build-push-autoresearch-gaudi.sh
-#      (override the image below if you push to registry.example.com)
+#      (override the image below if you push to a remote registry)
 #   2. A writable cache location for ~/.cache/autoresearch (data download is slow;
 #      a PVC or hostPath keeps it across runs). Default below is a hostPath.
 #   3. Cluster egress to huggingface.co for the first data download.
@@ -53,7 +53,7 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: autoresearch
-          image: registry.example.com/autoresearch-gaudi:latest
+          image: localhost:30500/autoresearch-gaudi:latest
           imagePullPolicy: Always
           command:
             - /bin/bash

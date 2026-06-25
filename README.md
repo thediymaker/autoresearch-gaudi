@@ -96,6 +96,8 @@ If the above commands all work ok, your setup is working and you can go into aut
 
 ## Running the agent
 
+### Option A — bring your own coding agent
+
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
 
 ```
@@ -103,6 +105,31 @@ Hi have a look at program.md and let's kick off a new experiment! let's do the s
 ```
 
 The `program.md` file is essentially a super lightweight "skill".
+
+### Option B — the bundled harness (`harness/run_loop.py`)
+
+`harness/run_loop.py` drives any **OpenAI-compatible** chat endpoint through the
+experiment loop autonomously (propose edit → score → keep/discard). Point it at
+your own model by setting three environment variables:
+
+| Variable | Purpose | Example |
+| --- | --- | --- |
+| `OPENAI_BASE_URL` | OpenAI-compatible API base (must end in `/v1`) | `http://localhost:8000/v1` |
+| `OPENAI_API_KEY`  | Bearer key sent as `Authorization: Bearer …` | `sk-...` |
+| `OPENAI_MODEL`    | Model name to request | `my-model` |
+
+Any provider that speaks the OpenAI chat-completions API works — a local vLLM
+server, OpenAI itself (`https://api.openai.com/v1`), or any compatible gateway.
+
+```bash
+export OPENAI_BASE_URL="http://localhost:8000/v1"
+export OPENAI_API_KEY="your-key-here"
+export OPENAI_MODEL="my-model"
+
+python harness/run_loop.py --experiment experiments/gpt_train --iterations 5
+```
+
+The harness exits early with `OPENAI_API_KEY is not set` if the key is missing.
 
 ## Project structure
 

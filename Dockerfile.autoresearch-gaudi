@@ -12,7 +12,7 @@
 # Build:
 #   ./autoresearch/build-push-autoresearch-gaudi.sh
 #   # or: podman build -f autoresearch/Dockerfile.autoresearch-gaudi \
-#   #       -t registry.example.com/autoresearch-gaudi:latest autoresearch/
+#   #       -t <your-registry>/autoresearch-gaudi:latest autoresearch/
 #
 FROM vault.habana.ai/gaudi-docker/1.23.0/ubuntu24.04/habanalabs/pytorch-installer-2.9.0:latest
 

@@ -1,0 +1,8 @@
+{
+  "name": "gpt_train",
+  "artifact": "../../train.py",
+  "scorer": "scorer.py",
+  "program": "program.md",
+  "metric": "val_bpb",
+  "goal": "minimize"
+}
