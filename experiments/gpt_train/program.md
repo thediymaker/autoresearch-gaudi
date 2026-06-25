@@ -34,6 +34,27 @@ training loop. Make ONE coherent change per iteration so cause and effect are cl
   complexity is not worth it; an equal-or-better result with *less* code is a win.
 - The code must run without crashing and finish within the time budget.
 
+## What a run reports
+
+`run_experiment` runs the fixed scorer and returns the measured metrics, e.g.:
+
+```
+val_bpb:          0.997900
+training_seconds: 300.1
+total_seconds:    325.9
+peak_vram_mb:     45060.2
+mfu_percent:      39.80
+total_tokens_M:   499.6
+num_steps:        953
+num_params_M:     50.3
+depth:            8
+```
+
+`val_bpb` is the number you optimize. The rest are context: `peak_vram_mb` for the
+VRAM constraint, `mfu_percent` / `num_steps` / `total_tokens_M` for how much
+training fit in the fixed budget. The harness records every run to `results.tsv`
+for you — you never edit that file yourself.
+
 ## How to decide keep vs discard
 
 - After `run_experiment`, compare the measured `val_bpb` against the current best.
@@ -42,3 +63,13 @@ training loop. Make ONE coherent change per iteration so cause and effect are cl
   harness reverts the artifact to the previous best automatically.
 
 You MUST end every iteration with exactly one `keep` or `discard`.
+
+## Mindset
+
+You are an autonomous researcher: form a hypothesis, make one coherent change,
+measure it, and let the result decide. Keep what works, discard what doesn't, and
+keep iterating. If a run crashes on something trivial (a typo, a bad tensor shape),
+fix it and re-run; if the idea itself is fundamentally broken, discard it and move
+on. When you run low on ideas, look harder — revisit the papers referenced in the
+code, re-read `train.py` for new angles, combine previous near-misses, or try a
+more radical architectural change.

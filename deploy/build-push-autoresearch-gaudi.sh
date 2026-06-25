@@ -1,12 +1,12 @@
 #!/bin/bash
 # Build the autoresearch-gaudi image and push to the container registry.
 # Default: local in-cluster registry (localhost:30500). Override with REGISTRY env,
-# e.g. REGISTRY=registry.example.com ./build-push-autoresearch-gaudi.sh
+# e.g. REGISTRY=registry.example.com ./deploy/build-push-autoresearch-gaudi.sh
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-cd "${PROJECT_ROOT}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../autoresearch/deploy
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../autoresearch (build context)
+cd "${REPO_ROOT}"
 
 export REGISTRY="${REGISTRY:-localhost:30500}"
 IMAGE_NAME="autoresearch-gaudi"
@@ -26,7 +26,7 @@ podman build \
     -f "${DOCKERFILE}" \
     -t "${REGISTRY}/${IMAGE_NAME}:${TAG}" \
     -t "${REGISTRY}/${IMAGE_NAME}:$(date +%Y%m%d)" \
-    "${SCRIPT_DIR}"
+    "${REPO_ROOT}"
 
 echo -e "${GREEN}Build complete!${NC}"
 echo -e "${YELLOW}Pushing to ${REGISTRY}...${NC}"

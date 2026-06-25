@@ -9,10 +9,10 @@
 #   4. torch.cuda.{synchronize,max_memory_allocated} -> torch.hpu equivalents.
 #   5. MFU peak-FLOPS constant H100 (989.5 TFLOPS) -> Gaudi 2 BF16 (432 TFLOPS).
 #
-# Build:
-#   ./autoresearch/build-push-autoresearch-gaudi.sh
-#   # or: podman build -f autoresearch/Dockerfile.autoresearch-gaudi \
-#   #       -t <your-registry>/autoresearch-gaudi:latest autoresearch/
+# Build (run from / with the autoresearch repo root as the build context):
+#   ./deploy/build-push-autoresearch-gaudi.sh
+#   # or: podman build -f deploy/Dockerfile.autoresearch-gaudi \
+#   #       -t <your-registry>/autoresearch-gaudi:latest .
 #
 FROM vault.habana.ai/gaudi-docker/1.23.0/ubuntu24.04/habanalabs/pytorch-installer-2.9.0:latest
 
@@ -35,8 +35,10 @@ RUN pip install --no-cache-dir \
     "rustbpe>=0.1.0" \
     "tiktoken>=0.11.0"
 
-# Application files (prepare.py is read-only data prep + eval; train.py is the model).
-COPY prepare.py train.py program.md README.md pyproject.toml ./
+# Application files. prepare.py is read-only data prep + eval; train.py is the
+# model (the single artifact the agent edits). Both live in the experiment dir.
+COPY pyproject.toml README.md ./
+COPY experiments/gpt_train/prepare.py experiments/gpt_train/train.py ./experiments/gpt_train/
 
 # Intel Gaudi: lazy graph mode (NEVER eager). Set here and in the Job manifest.
 ENV PT_HPU_LAZY_MODE=1 \
@@ -45,4 +47,4 @@ ENV PT_HPU_LAZY_MODE=1 \
 
 # Default: run one 5-minute training experiment. The Job manifest runs prepare.py
 # first (idempotent) to ensure data + tokenizer exist in the mounted cache.
-CMD ["python", "train.py"]
+CMD ["python", "experiments/gpt_train/train.py"]

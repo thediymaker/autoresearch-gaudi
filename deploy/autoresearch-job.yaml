@@ -5,19 +5,19 @@
 # work that is already done). The final val_bpb is printed in the pod logs.
 #
 # Prerequisites:
-#   1. Build + push the image:  ./autoresearch/build-push-autoresearch-gaudi.sh
+#   1. Build + push the image:  ./deploy/build-push-autoresearch-gaudi.sh
 #      (override the image below if you push to a remote registry)
 #   2. A writable cache location for ~/.cache/autoresearch (data download is slow;
 #      a PVC or hostPath keeps it across runs). Default below is a hostPath.
 #   3. Cluster egress to huggingface.co for the first data download.
 #
 # Usage:
-#   kubectl apply -f autoresearch/autoresearch-job.yaml
+#   kubectl apply -f deploy/autoresearch-job.yaml
 #   kubectl logs -f -n autoresearch job/autoresearch-experiment
 #
 # Re-run:
 #   kubectl delete job autoresearch-experiment -n autoresearch
-#   kubectl apply -f autoresearch/autoresearch-job.yaml
+#   kubectl apply -f deploy/autoresearch-job.yaml
 ---
 apiVersion: v1
 kind: Namespace
@@ -61,8 +61,8 @@ spec:
             - |
               set -e
               # One-time (idempotent) data + tokenizer prep, then a 5-min experiment.
-              python prepare.py --num-shards 10
-              python train.py
+              python experiments/gpt_train/prepare.py --num-shards 10
+              python experiments/gpt_train/train.py
           env:
             - name: PT_HPU_LAZY_MODE
               value: "1"

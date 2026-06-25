@@ -15,11 +15,15 @@ The idea: give an AI agent a small but real LLM training setup and let it experi
 
 ## How it works
 
-The repo is deliberately kept small and only really has three files that matter:
+The repo is deliberately kept small. The experiment-specific files live under
+`experiments/gpt_train/`, and only really three of them matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+- **`experiments/gpt_train/prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
+- **`experiments/gpt_train/train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`experiments/gpt_train/program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+
+Container and Kubernetes manifests live under `deploy/`; the generic, model-agnostic
+harness lives under `harness/`.
 
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
@@ -38,29 +42,29 @@ directly inside any Gaudi PyTorch container.
 
 ```bash
 # 1. Download data and train tokenizer (one-time, ~2 min)
-python prepare.py
+python experiments/gpt_train/prepare.py
 
 # 2. Run a single training experiment (~5 min)
-python train.py
+python experiments/gpt_train/train.py
 ```
 
 ### Option B — Kubernetes (the workflow used here)
 
 ```bash
 # 1. Build & push the Gaudi image (podman; override REGISTRY as needed)
-REGISTRY=<your-registry> ./build-push-autoresearch-gaudi.sh
+REGISTRY=<your-registry> ./deploy/build-push-autoresearch-gaudi.sh
 
 # 2. Start the debug pod (requests habana.ai/gaudi: 1 + hugepages-2Mi)
-kubectl apply -f autoresearch-debug.yaml
+kubectl apply -f deploy/autoresearch-debug.yaml
 
 # 3. One-time data prep inside the pod
 kubectl exec -n autoresearch autoresearch-debug -- \
-  bash -c "cd /workspace/autoresearch && python prepare.py --num-shards 10"
+  bash -c "cd /workspace/autoresearch && python experiments/gpt_train/prepare.py --num-shards 10"
 
 # 4. Copy your edited train.py in and run a 5-minute experiment
-kubectl cp train.py autoresearch/autoresearch-debug:/workspace/autoresearch/train.py
+kubectl cp train.py autoresearch/autoresearch-debug:/workspace/autoresearch/experiments/gpt_train/train.py
 kubectl exec -n autoresearch autoresearch-debug -- \
-  bash -c "cd /workspace/autoresearch && python train.py > /root/.cache/autoresearch/run.log 2>&1"
+  bash -c "cd /workspace/autoresearch/experiments/gpt_train && python train.py > /root/.cache/autoresearch/run.log 2>&1"
 
 # 5. Read the result
 kubectl exec -n autoresearch autoresearch-debug -- grep '^val_bpb:' /root/.cache/autoresearch/run.log
@@ -84,7 +88,7 @@ changes are platform-level:
   per-matrix graph-launch overhead.
 - **MFU**: peak-FLOPS constant set to Gaudi 2 BF16 (432 TFLOPS) for the MFU estimate.
 - **Deployment**: adds a Dockerfile, build/push script, and Kubernetes manifests
-  (`Dockerfile.autoresearch-gaudi`, `build-push-autoresearch-gaudi.sh`,
+  under `deploy/` (`Dockerfile.autoresearch-gaudi`, `build-push-autoresearch-gaudi.sh`,
   `autoresearch-debug.yaml`, `autoresearch-job.yaml`).
 
 > **Note on portability of results:** as the upstream README explains, the fixed

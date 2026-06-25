@@ -40,7 +40,7 @@ import sys
 # --- k8s backend config (overridable; matches autoresearch-debug.yaml) ------
 NAMESPACE = os.environ.get("AUTORESEARCH_NAMESPACE", "autoresearch")
 POD = os.environ.get("AUTORESEARCH_POD", "autoresearch-debug")
-POD_TRAIN_PATH = "/workspace/autoresearch/train.py"
+POD_TRAIN_PATH = "/workspace/autoresearch/experiments/gpt_train/train.py"
 LOG_PATH = "/root/.cache/autoresearch/run.log"
 
 RUN_TIMEOUT = 720  # 12 min hard ceiling (5-min budget + startup/compile/eval)
@@ -165,7 +165,7 @@ def run_k8s(artifact: str) -> dict:
     # 3) Run the experiment (blocks ~5 min + startup).
     try:
         _run(["kubectl", "exec", "-n", NAMESPACE, POD, "--", "bash", "-c",
-              f"cd /workspace/autoresearch && python train.py > {LOG_PATH} 2>&1"],
+              f"cd /workspace/autoresearch/experiments/gpt_train && python train.py > {LOG_PATH} 2>&1"],
              timeout=RUN_TIMEOUT)
     except subprocess.TimeoutExpired:
         crash("training run exceeded timeout", log=_log_tail())

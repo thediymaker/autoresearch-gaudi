@@ -1,6 +1,6 @@
 {
   "name": "gpt_train",
-  "artifact": "../../train.py",
+  "artifact": "train.py",
   "scorer": "scorer.py",
   "program": "program.md",
   "metric": "val_bpb",

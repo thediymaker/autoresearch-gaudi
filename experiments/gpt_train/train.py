@@ -503,7 +503,12 @@ class MuonAdamW(torch.optim.Optimizer):
 
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 192          # target head dimension for attention
+# HEAD_DIM must stay 128 on Intel Gaudi 2 (Habana 1.23). HEAD_DIM=192 gives exactly
+# 3 heads (192*3 == n_embd 576) and produces attention-projection matrix shapes that
+# trip a lazy-tensor lifetime bug in the batched Muon writeback ("ValidateSyncInput
+# Tensors tensor_data is empty"). Bisected: HEAD_DIM is the sole trigger (WINDOW_
+# PATTERN is irrelevant); 128 trains cleanly at ~24% MFU, 192 crashes on step 0.
+HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "LLLL" # sliding window pattern: L=full, S=half context
 
 # Optimization
